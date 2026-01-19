@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from config.database import get_database
 from schemas import UserResponse, OrderResponse
 from middleware import get_current_admin
-from typing import List, Dict, Any
+from utils.pagination import PaginationParams, SortParams, FilterParams, PaginatedResponse
+from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 from bson import ObjectId
 
@@ -75,43 +76,235 @@ async def get_dashboard_stats(
     }
 
 
-@router.get("/orders", response_model=List[OrderResponse])
+@router.get("/orders", response_model=dict)
 async def get_all_orders(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    status: str = Query(None),
+    pagination: PaginationParams = Depends(),
+    sort: SortParams = Depends(),
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by order status"),
+    payment_status_filter: Optional[str] = Query(None, alias="payment_status", description="Filter by payment status"),
+    min_date: Optional[str] = Query(None, description="Filter from date"),
+    max_date: Optional[str] = Query(None, description="Filter to date"),
+    min_amount: Optional[float] = Query(None, ge=0, description="Minimum order amount"),
+    max_amount: Optional[float] = Query(None, ge=0, description="Maximum order amount"),
     db=Depends(get_database),
     current_user: dict = Depends(get_current_admin)
 ):
-    """Get all orders (Admin only)"""
+    """Get all orders with advanced filtering"""
     query = {}
-    if status:
-        query["order_status"] = status
     
-    cursor = db.orders.find(query).sort("created_at", -1).skip(skip).limit(limit)
-    orders = await cursor.to_list(length=limit)
+    if status_filter:
+        query["order_status"] = status_filter
+    
+    if payment_status_filter:
+        query["payment_status"] = payment_status_filter
+    
+    # Date range filter
+    query.update(FilterParams.build_date_range_query(min_date, max_date, "created_at"))
+    
+    # Amount range filter
+    query.update(FilterParams.build_range_query(min_amount, max_amount, "total"))
+    
+    total = await db.orders.count_documents(query)
+    
+    sort_field, sort_direction = sort.to_tuple()
+    cursor = db.orders.find(query).sort(sort_field, sort_direction).skip(pagination.skip).limit(pagination.limit)
+    orders = await cursor.to_list(length=pagination.limit)
     
     for order in orders:
         order["_id"] = str(order["_id"])
     
-    return orders
+    paginated = PaginatedResponse(orders, total, pagination.skip, pagination.limit)
+    return paginated.to_dict()
 
 
-@router.get("/users", response_model=List[UserResponse])
+@router.get("/users", response_model=dict)
 async def get_all_users(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    pagination: PaginationParams = Depends(),
+    sort: SortParams = Depends(),
+    search: Optional[str] = Query(None, description="Search by email, username, or name"),
+    is_active: Optional[bool] = Query(None, description="Filter by active status"),
     db=Depends(get_database),
     current_user: dict = Depends(get_current_admin)
 ):
-    """Get all users (Admin only)"""
-    cursor = db.users.find({"role": "customer"}).sort("created_at", -1).skip(skip).limit(limit)
-    users = await cursor.to_list(length=limit)
+    """Get all users with filtering"""
+    query = {"role": "customer"}
+    
+    if search:
+        query.update(FilterParams.build_search_query(search, ["email", "username", "full_name"]))
+    
+    if is_active is not None:
+        query["is_active"] = is_active
+    
+    total = await db.users.count_documents(query)
+    
+    sort_field, sort_direction = sort.to_tuple()
+    cursor = db.users.find(query).sort(sort_field, sort_direction).skip(pagination.skip).limit(pagination.limit)
+    users = await cursor.to_list(length=pagination.limit)
     
     for user in users:
         user["_id"] = str(user["_id"])
     
-    return users
+    paginated = PaginatedResponse(users, total, pagination.skip, pagination.limit)
+    return paginated.to_dict()
+
+
+@router.put("/users/{user_id}/toggle-status")
+async def toggle_user_status(
+    user_id: str,
+    db=Depends(get_database),
+    current_user: dict = Depends(get_current_admin)
+):
+    """Toggle user active status (Admin only)"""
+    try:
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+    except:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID")
+    
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    
+    new_status = not user.get("is_active", True)
+    
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"is_active": new_status, "updated_at": datetime.utcnow()}}
+    )
+    
+    return {"message": f"User {'activated' if new_status else 'deactivated'} successfully"}
+
+
+@router.get("/sales/analytics", response_model=dict)
+async def get_sales_analytics(
+    start_date: Optional[str] = Query(None, description="Start date (ISO format)"),
+    end_date: Optional[str] = Query(None, description="End date (ISO format)"),
+    db=Depends(get_database),
+    current_user: dict = Depends(get_current_admin)
+):
+    """Get sales analytics"""
+    
+    # Build date filter
+    date_filter = FilterParams.build_date_range_query(start_date, end_date, "created_at")
+    query = {}
+    if date_filter:
+        query["created_at"] = date_filter.get("created_at", {})
+    
+    # Sales by day
+    daily_sales_pipeline = [
+        {"$match": query} if query else {"$match": {}},
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}
+                },
+                "total_sales": {"$sum": "$total"},
+                "order_count": {"$sum": 1}
+            }
+        },
+        {"$sort": {"_id": 1}}
+    ]
+    daily_sales = await db.orders.aggregate(daily_sales_pipeline).to_list(length=100)
+    
+    # Sales by category
+    category_sales_pipeline = [
+        {"$match": query} if query else {"$match": {}},
+        {"$unwind": "$items"},
+        {
+            "$lookup": {
+                "from": "products",
+                "localField": "items.product_id",
+                "foreignField": "_id",
+                "as": "product"
+            }
+        },
+        {"$unwind": "$product"},
+        {
+            "$lookup": {
+                "from": "categories",
+                "localField": "product.category_id",
+                "foreignField": "_id",
+                "as": "category"
+            }
+        },
+        {"$unwind": "$category"},
+        {
+            "$group": {
+                "_id": "$category.name",
+                "total_sales": {"$sum": "$items.subtotal"},
+                "quantity_sold": {"$sum": "$items.quantity"}
+            }
+        },
+        {"$sort": {"total_sales": -1}}
+    ]
+    category_sales = await db.orders.aggregate(category_sales_pipeline).to_list(length=50)
+    
+    return {
+        "daily_sales": daily_sales,
+        "category_sales": category_sales
+    }
+
+
+@router.get("/reports/inventory", response_model=dict)
+async def get_inventory_report(
+    pagination: PaginationParams = Depends(),
+    sort: SortParams = Depends(),
+    stock_level: Optional[str] = Query(None, regex="^(out_of_stock|low|medium|high)$", description="Filter by stock level"),
+    search: Optional[str] = Query(None, description="Search by product name"),
+    db=Depends(get_database),
+    current_user: dict = Depends(get_current_admin)
+):
+    """Get inventory report with filtering"""
+    
+    # Build stock level query
+    stock_queries = {
+        "out_of_stock": {"stock_quantity": {"$lte": 0}},
+        "low": {"stock_quantity": {"$gt": 0, "$lte": 10}},
+        "medium": {"stock_quantity": {"$gt": 10, "$lte": 50}},
+        "high": {"stock_quantity": {"$gt": 50}}
+    }
+    
+    query = {}
+    if stock_level:
+        query.update(stock_queries[stock_level])
+    
+    if search:
+        query.update(FilterParams.build_search_query(search, ["name"]))
+    
+    total = await db.products.count_documents(query)
+    
+    sort_field, sort_direction = sort.to_tuple()
+    cursor = db.products.find(query).sort(sort_field, sort_direction).skip(pagination.skip).limit(pagination.limit)
+    products = await cursor.to_list(length=pagination.limit)
+    
+    for product in products:
+        product["_id"] = str(product["_id"])
+    
+    # Get overall stock statistics
+    stats_pipeline = [
+        {
+            "$group": {
+                "_id": {
+                    "$switch": {
+                        "branches": [
+                            {"case": {"$lte": ["$stock_quantity", 0]}, "then": "Out of Stock"},
+                            {"case": {"$lte": ["$stock_quantity", 10]}, "then": "Low Stock"},
+                            {"case": {"$lte": ["$stock_quantity", 50]}, "then": "Medium Stock"},
+                        ],
+                        "default": "High Stock"
+                    }
+                },
+                "count": {"$sum": 1},
+                "total_value": {"$sum": {"$multiply": ["$price", "$stock_quantity"]}}
+            }
+        }
+    ]
+    stock_levels = await db.products.aggregate(stats_pipeline).to_list(length=10)
+    
+    paginated = PaginatedResponse(products, total, pagination.skip, pagination.limit)
+    
+    return {
+        "products": paginated.to_dict(),
+        "stock_levels": stock_levels
+    }
 
 
 @router.put("/users/{user_id}/toggle-status")
