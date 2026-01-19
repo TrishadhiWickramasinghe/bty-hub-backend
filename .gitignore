@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.env
+*.venv
+venv/
+ENV/
+env/
+.venv/
+env.bak/
+*.sqlite3
+
+# FastAPI/Uvicorn logs
+*.log
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test and coverage reports
+htmlcov/
+.coverage
+.tox/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Pipenv
+Pipfile.lock
+
+# Mypy
+.mypy_cache/
+
+# Others
+.idea/
